@@ -37,14 +37,14 @@ for how to create a image repository.
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, Iterable, Mapping, Optional, Any
+from typing import Dict, Iterable, Mapping, Optional, Any, Tuple
 
 import torchx
 import yaml
 from torchx.schedulers.api import (
     AppDryRunInfo,
     DescribeAppResponse,
-    Scheduler,
+    WorkspaceScheduler,
     Stream,
     filter_regex,
 )
@@ -57,6 +57,9 @@ from torchx.specs.api import (
     macros,
     runopts,
     CfgVal,
+)
+from torchx.schedulers.docker_patcher import (
+    DockerPatcher,
 )
 
 JOB_STATE: Dict[str, AppState] = {
@@ -83,7 +86,7 @@ def role_to_node_properties(idx: int, role: Role) -> Dict[str, object]:
         mem = 1000
     reqs.append({"type": "MEMORY", "value": str(mem)})
 
-    if resource.gpu >= 0:
+    if resource.gpu > 0:
         reqs.append({"type": "GPU", "value": str(resource.gpu)})
 
     container = {
@@ -108,6 +111,8 @@ class BatchJob:
     queue: str
     job_def: Dict[str, object]
 
+    images_to_push: Dict[str, Tuple[str, str]]
+
     def __str__(self) -> str:
         return yaml.dump(self.job_def)
 
@@ -115,7 +120,7 @@ class BatchJob:
         return str(self)
 
 
-class AWSBatchScheduler(Scheduler):
+class AWSBatchScheduler(WorkspaceScheduler):
     """
     AWSBatchScheduler is a TorchX scheduling interface to AWS Batch.
 
@@ -155,6 +160,7 @@ class AWSBatchScheduler(Scheduler):
         client: Optional[Any] = None,
         # pyre-fixme[2]: Parameter annotation cannot be `Any`.
         log_client: Optional[Any] = None,
+        docker_client: Optional["DockerClient"] = None,
     ) -> None:
         super().__init__("aws_batch", session_name)
 
@@ -162,6 +168,7 @@ class AWSBatchScheduler(Scheduler):
         self.__client = client
         # pyre-fixme[4]: Attribute annotation cannot be `Any`.
         self.__log_client = log_client
+        self._patcher = DockerPatcher(docker_client)
 
     @property
     # pyre-fixme[3]: Return annotation cannot be `Any`.
@@ -184,6 +191,10 @@ class AWSBatchScheduler(Scheduler):
     def schedule(self, dryrun_info: AppDryRunInfo[BatchJob]) -> str:
         cfg = dryrun_info._cfg
         assert cfg is not None, f"{dryrun_info} missing cfg"
+
+        images_to_push = dryrun_info.request.images_to_push
+        self._patcher.push_images(images_to_push)
+
         req = dryrun_info.request
         self._client.register_job_definition(**req.job_def)
 
@@ -203,6 +214,9 @@ class AWSBatchScheduler(Scheduler):
         if not isinstance(queue, str):
             raise TypeError(f"config value 'queue' must be a string, got {queue}")
         name = make_unique(app.name)
+
+        # map any local images to the remote image
+        images_to_push = self._patcher.update_app_images(app, cfg)
 
         nodes = []
 
@@ -241,6 +255,7 @@ class AWSBatchScheduler(Scheduler):
                     "torchx.pytorch.org/app-name": app.name,
                 },
             },
+            images_to_push=images_to_push,
         )
         info = AppDryRunInfo(req, repr)
         info._app = app
@@ -261,6 +276,11 @@ class AWSBatchScheduler(Scheduler):
     def run_opts(self) -> runopts:
         opts = runopts()
         opts.add("queue", type_=str, help="queue to schedule job in", required=True)
+        opts.add(
+            "image_repo",
+            type_=str,
+            help="The image repository to use when pushing patched images, must have push access. Ex: example.com/your/container",
+        )
         return opts
 
     def _get_job_id(self, app_id: str) -> Optional[str]:
@@ -397,6 +417,20 @@ class AWSBatchScheduler(Scheduler):
 
             for event in response["events"]:
                 yield event["message"]
+
+    def build_workspace_image(self, img: str, workspace: str) -> str:
+        """
+        build_workspace_image creates a new image with the files in workspace
+        overlaid on top of it.
+
+        Args:
+            img: a Docker image to use as a base
+            workspace: a fsspec path to a directory with contents to be overlaid
+
+        Returns:
+            The new Docker image ID.
+        """
+        return self._patcher.build_container_from_workspace(img, workspace)
 
 
 def create_scheduler(session_name: str, **kwargs: object) -> AWSBatchScheduler:
