@@ -9,7 +9,7 @@ set -ex
 
 if [ -z "$AWS_ROLE_ARN" ]; then
   # only dryrun if no secrets
-  torchx run --wait --scheduler aws_batch --dryrun -c queue=torchx utils.echo
+  torchx run --wait --scheduler aws_batch --dryrun -c queue=torchx,image_repo=495572122715.dkr.ecr.us-west-2.amazonaws.com/torchx/integration-tests utils.echo
 else
   APP_ID="$(torchx run --wait --scheduler aws_batch -c queue=torchx utils.echo)"
   torchx status "$APP_ID"
